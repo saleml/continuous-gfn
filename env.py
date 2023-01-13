@@ -11,7 +11,6 @@ class Box:
         self,
         dim=2,
         delta=0.1,
-        delta_min=0.04,
         epsilon=1e-4,
         R0=0.1,
         R1=0.5,
@@ -22,7 +21,6 @@ class Box:
     ):
         # Set verify_actions to False to disable action verification for faster step execution.
         self.dim = dim
-        self.delta_min = delta_min
         self.delta = delta
         self.epsilon = epsilon
         self.device_str = device_str
@@ -113,8 +111,8 @@ class Box:
         if not self.reward_cos:
             return (
                 self.R0
-                + 2 * (0.25) ** self.dim * self.R1
-                + 2 * (0.1) ** self.dim * self.R2
+                + (2 * 0.25) ** self.dim * self.R1
+                + (2 * 0.1) ** self.dim * self.R2
             )
         else:
             return self.R0 + self.R1 * 0.1973 ** 2  # 0.1973 is the integral of the pdf, evaluated with Wolfram Alpha

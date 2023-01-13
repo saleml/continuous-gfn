@@ -189,8 +189,8 @@ for i in trange(args.n_iterations):
             plt.close("all")
             fig3 = plt.figure(figsize=(6 * 16 / 9, 6))
             n = 100
-            x = torch.linspace(0, 1, n)
-            y = torch.linspace(0, 1, n)
+            x = torch.linspace(0.0, 1, n)
+            y = torch.linspace(0.0, 1, n)
             xx, yy = torch.meshgrid(x, y)
             states = torch.stack([xx, yy], dim=-1).reshape(-1, 2)
 
