@@ -3,6 +3,7 @@ kolya-gmm/*
 .DS_Store
 .vscode/*
 wabdb/settings
+old/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
