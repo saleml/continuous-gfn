@@ -1,5 +1,5 @@
 import torch
-from torch.distributions import Beta, Categorical, Independent, MixtureSameFamily
+from torch.distributions import Distribution, Beta
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm, trange
@@ -26,13 +26,38 @@ USE_WANDB = True
 parser = argparse.ArgumentParser()
 parser.add_argument("--dim", type=int, default=2)
 parser.add_argument("--delta", type=float, default=0.1)
-parser.add_argument("--epsilon", type=float, default=1e-4)
+parser.add_argument("--env-epsilon", type=float, default=1e-4)
 parser.add_argument(
     "--n_components",
     type=int,
     default=1,
     help="Number of components in Mixture Of Betas",
 )
+parser.add_argument(
+    "--beta-min",
+    type=float,
+    default=0.1,
+    help="Minimum value for the concentration parameters of the Beta distribution",
+)
+parser.add_argument(
+    "--beta-max",
+    type=float,
+    default=2.0,
+    help="Maximum value for the concentration parameters of the Beta distribution",
+)
+parser.add_argument(
+    "--epsilon",
+    type=float,
+    default=0.0,
+    help="OFF-POLICY: with proba epsilon, sample from the uniform distribution in the quarter circle",
+)
+parser.add_argument(
+    "--min-terminate-proba",
+    type=float,
+    default=0.0,
+    help="OFF-POLICY: all terminating probabilities below this value are set to this value",
+)
+
 parser.add_argument(
     "--PB",
     type=str,
@@ -54,13 +79,14 @@ if USE_WANDB:
 
 dim = args.dim
 delta = args.delta
-epsilon = args.epsilon
 seed = args.seed
 lr = args.lr
 lr_Z = args.lr_Z
 n_iterations = args.n_iterations
 BS = args.BS
 n_components = args.n_components
+epsilon = args.epsilon
+min_terminate_proba = args.min_terminate_proba
 
 if seed == 0:
     seed = np.random.randint(int(1e6))
@@ -71,7 +97,7 @@ np.random.seed(seed)
 env = Box(
     dim=dim,
     delta=delta,
-    epsilon=epsilon,
+    epsilon=args.env_epsilon,
     device_str="cpu",
     reward_cos=False,
     verify_actions=False,
@@ -93,43 +119,56 @@ if USE_WANDB:
     )
 
 
-model = CirclePF(hidden_dim=args.hidden_dim, n_hidden=args.n_hidden)
+model = CirclePF(
+    hidden_dim=args.hidden_dim,
+    n_hidden=args.n_hidden,
+    n_components=n_components,
+    beta_min=args.beta_min,
+    beta_max=args.beta_max,
+)
 bw_model = CirclePB(
     hidden_dim=args.hidden_dim,
     n_hidden=args.n_hidden,
     torso=model.torso if args.PB == "tied" else None,
     uniform=args.PB == "uniform",
+    n_components=n_components,
+    beta_min=args.beta_min,
+    beta_max=args.beta_max,
 )
 
 
-def sample_actions(model, states, on_policy=False):
+def sample_actions(model, states, min_terminate_proba=0.0, epsilon=0.0):
+    # with probability epsilon, sample uniformly in the quarter circle
     # states is a tensor of shape (n, dim)
     batch_size = states.shape[0]
-    out = model(states)
-    if len(out) == 4:  # s0 input
-        alpha_r, alpha_theta, beta_r, beta_theta = out
-        alpha = torch.stack([alpha_r, alpha_theta], dim=1)
-        beta = torch.stack([beta_r, beta_theta], dim=1)
-        dist = Beta(alpha, beta)
-
-        samples = dist.sample(torch.Size((batch_size,))).squeeze(1)
-        r, theta = samples[:, 0], samples[:, 1]
+    out = model.to_dist(states)
+    if isinstance(out[0], Distribution):  # s0 input
+        dist_r, dist_theta = out
+        samples_r = dist_r.sample(torch.Size((batch_size,)))
+        samples_theta = dist_theta.sample(torch.Size((batch_size,)))
+        if epsilon > 0:
+            uniform_mask = torch.rand(batch_size) < epsilon
+            samples_r[uniform_mask] = torch.rand_like(samples_r[uniform_mask])
+            samples_theta[uniform_mask] = torch.rand_like(samples_theta[uniform_mask])
         actions = (
             torch.stack(
                 [
-                    r * torch.cos(torch.pi / 2.0 * theta),
-                    r * torch.sin(torch.pi / 2.0 * theta),
+                    samples_r * torch.cos(torch.pi / 2.0 * samples_theta),
+                    samples_r * torch.sin(torch.pi / 2.0 * samples_theta),
                 ],
                 dim=1,
             )
             * env.delta
         )
-        logprobs = dist.log_prob(samples).sum(dim=1) - torch.log(r * env.delta)
-
+        logprobs = (
+            dist_r.log_prob(samples_r)
+            + dist_theta.log_prob(samples_theta)
+            - torch.log(samples_r * env.delta)
+            - np.log(np.pi / 2)
+        )
     else:
-        exit_proba, alpha, beta = out
-        if not on_policy:
-            exit_proba = exit_proba.clamp_min(0.1)
+        exit_proba, dist = out
+        exit_proba = exit_proba.clamp_min(min_terminate_proba)
         exit = torch.bernoulli(exit_proba).bool()
         exit[torch.norm(1 - states, dim=1) <= env.delta] = True
         exit[torch.any(states >= 1 - env.epsilon, dim=-1)] = True
@@ -147,8 +186,10 @@ def sample_actions(model, states, on_policy=False):
             B[~torch.any(states >= 1 - env.delta, dim=-1)]
             >= A[~torch.any(states >= 1 - env.delta, dim=-1)]
         )
-        dist = Beta(alpha, beta)
         samples = dist.sample()
+        if epsilon > 0:
+            uniform_mask = torch.rand(batch_size) < epsilon
+            samples[uniform_mask] = torch.rand_like(samples[uniform_mask])
         actions = samples * (B - A) + A
         actions *= torch.pi / 2.0
         actions = (
@@ -170,7 +211,7 @@ def sample_actions(model, states, on_policy=False):
     return actions, logprobs
 
 
-def sample_trajectories(model, n_trajectories, on_policy=False):
+def sample_trajectories(model, n_trajectories, min_terminate_proba=0.0, epsilon=0.0):
     states = torch.zeros((n_trajectories, env.dim), device=env.device)
     actionss = []
     trajectories = [states]
@@ -181,9 +222,12 @@ def sample_trajectories(model, n_trajectories, on_policy=False):
             (n_trajectories, env.dim), -float("inf"), device=env.device
         )
         non_terminal_actions, logprobs = sample_actions(
-            model, states[non_terminal_mask], on_policy=on_policy
+            model,
+            states[non_terminal_mask],
+            min_terminate_proba=min_terminate_proba,
+            epsilon=epsilon,
         )
-        actions[non_terminal_mask] = non_terminal_actions
+        actions[non_terminal_mask] = non_terminal_actions.reshape(-1, env.dim)
         actionss.append(actions)
         states = env.step(states, actions)
         trajectories.append(states)
@@ -214,8 +258,7 @@ def evaluate_backward_logprobs(model, trajectories):
             2.0 / torch.pi * torch.arcsin((current_states[:, 1]) / env.delta),
         )
 
-        alpha, beta = model(current_states)
-        dist = Beta(alpha, beta)
+        dist = model.to_dist(current_states)
 
         step_logprobs = (
             dist.log_prob(
@@ -254,9 +297,17 @@ if args.PB != "uniform":
 optimizer.add_param_group({"params": [logZ], "lr": lr_Z})
 
 jsd = float("inf")
+
 for i in trange(n_iterations):
+    current_epsilon = epsilon
+    current_min_terminate_proba = min_terminate_proba
     optimizer.zero_grad()
-    trajectories, actionss, logprobs = sample_trajectories(model, BS, on_policy=True)
+    trajectories, actionss, logprobs = sample_trajectories(
+        model,
+        BS,
+        epsilon=current_epsilon,
+        min_terminate_proba=current_min_terminate_proba,
+    )
     last_states = get_last_states(env, trajectories)
     logrewards = env.reward(last_states).log()
     bw_logprobs = evaluate_backward_logprobs(bw_model, trajectories)
@@ -296,9 +347,7 @@ for i in trange(n_iterations):
             f"{i}: {loss.item()}, {logZ.item()}, {np.log(env.Z)}, {jsd}, {tuple(trajectories.shape)}"
         )
     if i % 1000 == 0:
-        trajectories, actionss, logprobs = sample_trajectories(
-            model, 1000, on_policy=True
-        )
+        trajectories, actionss, logprobs = sample_trajectories(model, 10000)
         last_states = get_last_states(env, trajectories)
         kde, fig4 = fit_kde(last_states)
         jsd = estimate_jsd(kde, true_kde)
@@ -306,7 +355,7 @@ for i in trange(n_iterations):
         if USE_WANDB:
             colors = plt.cm.rainbow(np.linspace(0, 1, 10))
 
-            fig1 = plot_samples(last_states.detach().cpu().numpy())
+            fig1 = plot_samples(last_states[:2000].detach().cpu().numpy())
             fig2 = plot_trajectories(trajectories.detach().cpu().numpy()[:20])
             fig3 = plot_termination_probabilities(model)
 

@@ -55,13 +55,14 @@ def fit_kde(last_states, kernel="exponential", bandwidth=0.1, plot=False):
 
 
 def estimate_jsd(kde1, kde2):
+    # Estimate Jensen-Shannon divergence between two KDEs
     test_states, n = get_test_states()
     log_dens1 = kde1.score_samples(test_states)
     log_dens2 = kde2.score_samples(test_states)
-    return 0.5 * (
-        np.mean(np.exp(log_dens1) * (log_dens1 - log_dens2))
-        + np.mean(np.exp(log_dens2) * (log_dens2 - log_dens1))
-    )
+    log_dens = np.log(0.5 * np.exp(log_dens1) + 0.5 * np.exp(log_dens2))
+    jsd = np.mean(np.exp(log_dens1) * (log_dens1 - log_dens))
+    jsd += np.mean(np.exp(log_dens2) * (log_dens2 - log_dens))
+    return jsd
 
 
 def plot_trajectories(trajectories, plot=False):
