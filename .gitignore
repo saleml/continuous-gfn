@@ -4,6 +4,8 @@ kolya-gmm/*
 .vscode/*
 wabdb/settings
 old/*
+saved_models/*
+*.pdf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,3 +1,5 @@
+import json
+import os
 import torch
 from torch.distributions import Distribution, Beta
 import matplotlib.pyplot as plt
@@ -25,12 +27,21 @@ USE_WANDB = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dim", type=int, default=2)
-parser.add_argument("--delta", type=float, default=0.1)
-parser.add_argument("--env-epsilon", type=float, default=1e-4)
+parser.add_argument("--delta", type=float, default=0.25)
+parser.add_argument("--env-epsilon", type=float, default=1e-10)
 parser.add_argument(
     "--n_components",
     type=int,
-    default=1,
+    default=2,
+    help="Number of components in Mixture Of Betas",
+)
+parser.add_argument("--reward_debug", action="store_true", default=False)
+parser.add_argument("--reward_gaussian", action="store_true", default=False)
+
+parser.add_argument(
+    "--n_components_s0",
+    type=int,
+    default=4,
     help="Number of components in Mixture Of Betas",
 )
 parser.add_argument(
@@ -42,7 +53,7 @@ parser.add_argument(
 parser.add_argument(
     "--beta-max",
     type=float,
-    default=2.0,
+    default=5.0,
     help="Maximum value for the concentration parameters of the Beta distribution",
 )
 parser.add_argument(
@@ -57,7 +68,25 @@ parser.add_argument(
     default=0.0,
     help="OFF-POLICY: all terminating probabilities below this value are set to this value",
 )
-
+parser.add_argument(
+    "--max-terminate-proba",
+    type=float,
+    default=1.0,
+    help="OFF-POLICY: all terminating probabilities above this value are set to this value",
+)
+parser.add_argument(
+    "--max-terminate-proba-shift",
+    type=float,
+    default=0.0,
+    help="OFF-POLICY: after each action, add this shift to max-terminate-proba (so that it gets to 1 eventually)",
+)
+parser.add_argument(
+    "--directed-exploration",
+    action="store_true",
+    default=False,
+    help="If true, use a Beta(0.5, 0.5) instead of uniform to temper",
+)
+parser.add_argument("--loss", type=str, choices=["tb", "hvi", "soft"], default="tb")
 parser.add_argument(
     "--PB",
     type=str,
@@ -66,15 +95,17 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--lr", type=float, default=1e-3)
-parser.add_argument("--lr_Z", type=float, default=1e-1)
+parser.add_argument("--lr_Z", type=float, default=5e-2)
 parser.add_argument("--BS", type=int, default=128)
-parser.add_argument("--n_iterations", type=int, default=100000)
+parser.add_argument("--n_iterations", type=int, default=20000)
 parser.add_argument("--hidden_dim", type=int, default=128)
 parser.add_argument("--n_hidden", type=int, default=3)
+parser.add_argument("--n_evaluation_trajectories", type=int, default=10000)
 args = parser.parse_args()
 
+
 if USE_WANDB:
-    wandb.init(project="cont_hypergrid", save_code=True)
+    wandb.init(project="continuous_gflownets", save_code=True)
     wandb.config.update(args)
 
 dim = args.dim
@@ -85,11 +116,22 @@ lr_Z = args.lr_Z
 n_iterations = args.n_iterations
 BS = args.BS
 n_components = args.n_components
+n_components_s0 = args.n_components_s0
 epsilon = args.epsilon
 min_terminate_proba = args.min_terminate_proba
+max_terminate_proba = args.max_terminate_proba
+max_terminate_proba_shift = args.max_terminate_proba_shift
+loss_type = args.loss
 
 if seed == 0:
     seed = np.random.randint(int(1e6))
+
+run_name = f"d{delta}_{loss_type}_PB{args.PB}_lr{lr}_lrZ{lr_Z}_sd{seed}"
+run_name += f"_n{n_components}_n0{n_components_s0}_eps{epsilon}"
+run_name += f"_min{min_terminate_proba}_max{max_terminate_proba}_shift{max_terminate_proba_shift}"
+print(run_name)
+if USE_WANDB:
+    wandb.run.name = run_name  # type: ignore
 
 torch.manual_seed(seed)
 np.random.seed(seed)
@@ -99,7 +141,8 @@ env = Box(
     delta=delta,
     epsilon=args.env_epsilon,
     device_str="cpu",
-    reward_cos=False,
+    reward_debug=args.reward_debug,
+    reward_gaussian=args.reward_gaussian,
     verify_actions=False,
 )
 
@@ -123,6 +166,8 @@ model = CirclePF(
     hidden_dim=args.hidden_dim,
     n_hidden=args.n_hidden,
     n_components=n_components,
+    n_components_s0=n_components_s0,
+    one_component=n_components == 1 and n_components_s0 == 1,
     beta_min=args.beta_min,
     beta_max=args.beta_max,
 )
@@ -137,7 +182,9 @@ bw_model = CirclePB(
 )
 
 
-def sample_actions(model, states, min_terminate_proba=0.0, epsilon=0.0):
+def sample_actions(
+    model, states, min_terminate_proba=0.0, max_terminate_proba=1.0, epsilon=0.0
+):
     # with probability epsilon, sample uniformly in the quarter circle
     # states is a tensor of shape (n, dim)
     batch_size = states.shape[0]
@@ -163,12 +210,30 @@ def sample_actions(model, states, min_terminate_proba=0.0, epsilon=0.0):
         logprobs = (
             dist_r.log_prob(samples_r)
             + dist_theta.log_prob(samples_theta)
+            # + np.log(4 / (env.delta**2 * np.pi))  # debugging
             - torch.log(samples_r * env.delta)
             - np.log(np.pi / 2)
+            - np.log(env.delta)  # why ?
         )
+        # print("logprobs", logprobs.exp().mean(), logprobs.exp().std())
+        # print(
+        #     (2 * dist_r.log_prob(samples_r).exp() / samples_r).mean(),  # pdf of radius for uniform in disk
+        #     (2 * dist_r.log_prob(samples_r).exp() / samples_r).std(),
+        # )
+        # print(
+        #     dist_theta.log_prob(samples_theta).exp().mean(),
+        #     dist_theta.log_prob(samples_theta).exp().std(),
+        # )
+        if n_components == 1 and n_components_s0 == 1:
+            entropies = dist_r.entropy() + dist_theta.entropy()
+        else:
+            entropies = torch.zeros(
+                batch_size
+            )  # the previous line is not implemented in general
     else:
         exit_proba, dist = out
-        exit_proba = exit_proba.clamp_min(min_terminate_proba)
+        exit_proba = exit_proba.clamp(min_terminate_proba, max_terminate_proba)
+
         exit = torch.bernoulli(exit_proba).bool()
         exit[torch.norm(1 - states, dim=1) <= env.delta] = True
         exit[torch.any(states >= 1 - env.epsilon, dim=-1)] = True
@@ -199,7 +264,10 @@ def sample_actions(model, states, min_terminate_proba=0.0, epsilon=0.0):
         logprobs = (
             dist.log_prob(samples)
             + torch.log(1 - exit_proba)
-            + torch.log(2.0 / (torch.pi * env.delta * (B - A)))
+            - np.log(env.delta)
+            - np.log(np.pi / 2)
+            - torch.log(B - A)
+            # + torch.log(2.0 / (torch.pi * env.delta * (B - A)))
             # - 0.5 * torch.log(1 - torch.cos(actions[:, 0]) ** 2)
         )
 
@@ -208,23 +276,39 @@ def sample_actions(model, states, min_terminate_proba=0.0, epsilon=0.0):
         logprobs[torch.norm(1 - states, dim=1) <= env.delta] = 0.0
         logprobs[torch.any(states >= 1 - env.epsilon, dim=-1)] = 0.0
 
-    return actions, logprobs
+        if n_components == 1 and n_components_s0 == 1:
+            entropies = (
+                -exit_proba * torch.log(exit_proba)
+                - (1 - exit_proba) * torch.log(1 - exit_proba)
+                + dist.entropy() * (1 - exit_proba)
+            )
+        else:
+            entropies = torch.zeros(
+                batch_size
+            )  # the previous line is not implemented in general
+
+    return actions, logprobs, entropies
 
 
-def sample_trajectories(model, n_trajectories, min_terminate_proba=0.0, epsilon=0.0):
+def sample_trajectories(
+    model, n_trajectories, min_terminate_proba=0.0, max_terminate_proba=1.0, epsilon=0.0
+):
+    step = 0
     states = torch.zeros((n_trajectories, env.dim), device=env.device)
     actionss = []
     trajectories = [states]
     trajectories_logprobs = torch.zeros((n_trajectories,), device=env.device)
+    trajectories_entropies = torch.zeros((n_trajectories,), device=env.device)
     while not torch.all(states == env.sink_state):
         non_terminal_mask = torch.all(states != env.sink_state, dim=-1)
         actions = torch.full(
             (n_trajectories, env.dim), -float("inf"), device=env.device
         )
-        non_terminal_actions, logprobs = sample_actions(
+        non_terminal_actions, logprobs, entropies = sample_actions(
             model,
             states[non_terminal_mask],
             min_terminate_proba=min_terminate_proba,
+            max_terminate_proba=max_terminate_proba + step * max_terminate_proba_shift,
             epsilon=epsilon,
         )
         actions[non_terminal_mask] = non_terminal_actions.reshape(-1, env.dim)
@@ -232,9 +316,11 @@ def sample_trajectories(model, n_trajectories, min_terminate_proba=0.0, epsilon=
         states = env.step(states, actions)
         trajectories.append(states)
         trajectories_logprobs[non_terminal_mask] += logprobs
+        trajectories_entropies[non_terminal_mask] += entropies
+        step += 1
     trajectories = torch.stack(trajectories, dim=1)
     actionss = torch.stack(actionss, dim=1)
-    return trajectories, actionss, trajectories_logprobs
+    return trajectories, actionss, trajectories_logprobs, trajectories_entropies
 
 
 def evaluate_backward_logprobs(model, trajectories):
@@ -268,7 +354,10 @@ def evaluate_backward_logprobs(model, trajectories):
                     * (2.0 / torch.pi * torch.acos(difference_1 / env.delta) - A)
                 ).clamp(1e-4, 1 - 1e-4)
             ).clamp_max(100)
-            + torch.log(2.0 / (torch.pi * env.delta * (B - A)))
+            - np.log(env.delta)
+            - np.log(np.pi / 2)
+            - torch.log(B - A)
+            # + torch.log(2.0 / (torch.pi * env.delta * (B - A)))
             # - 0.5 * torch.log(1 - (difference_1 / env.delta) ** 2)
         )
 
@@ -301,18 +390,32 @@ jsd = float("inf")
 for i in trange(n_iterations):
     current_epsilon = epsilon
     current_min_terminate_proba = min_terminate_proba
+    current_max_terminate_proba = max_terminate_proba
     optimizer.zero_grad()
-    trajectories, actionss, logprobs = sample_trajectories(
+    trajectories, actionss, logprobs, entropies = sample_trajectories(
         model,
         BS,
         epsilon=current_epsilon,
         min_terminate_proba=current_min_terminate_proba,
+        max_terminate_proba=current_max_terminate_proba,
     )
     last_states = get_last_states(env, trajectories)
     logrewards = env.reward(last_states).log()
     bw_logprobs = evaluate_backward_logprobs(bw_model, trajectories)
 
-    loss = torch.mean((logZ + logprobs - bw_logprobs - logrewards) ** 2)
+    if loss_type == "tb":
+        loss = torch.mean((logZ + logprobs - bw_logprobs - logrewards) ** 2)
+    elif loss_type == "hvi":
+        scores = logprobs - bw_logprobs - logrewards
+        baseline = scores.mean().detach()
+        loss = logprobs * (scores.detach() - baseline) - bw_logprobs
+        loss = torch.mean(loss)
+    elif loss_type == "soft":
+        entropic_rewards = logrewards + entropies.detach() * 0.01
+        loss = -logprobs * entropic_rewards
+        loss = torch.mean(loss)
+    else:
+        raise ValueError("Unknown loss type")
     if torch.isinf(loss):
         raise ValueError("Infinite loss")
     loss.backward()
@@ -338,7 +441,7 @@ for i in trange(n_iterations):
             wandb.log(
                 {
                     "loss": loss.item(),
-                    "logZdiff": logZ.item() - np.log(env.Z),
+                    "logZdiff": np.log(env.Z) - logZ.item(),
                     "states_visited": (i + 1) * BS,
                 },
                 step=i,
@@ -347,7 +450,10 @@ for i in trange(n_iterations):
             f"{i}: {loss.item()}, {logZ.item()}, {np.log(env.Z)}, {jsd}, {tuple(trajectories.shape)}"
         )
     if i % 1000 == 0:
-        trajectories, actionss, logprobs = sample_trajectories(model, 10000)
+        # print(list(model.PFs0.values()))
+        trajectories, actionss, logprobs, entropies = sample_trajectories(
+            model, args.n_evaluation_trajectories
+        )
         last_states = get_last_states(env, trajectories)
         kde, fig4 = fit_kde(last_states)
         jsd = estimate_jsd(kde, true_kde)
@@ -373,3 +479,13 @@ for i in trange(n_iterations):
 
 if USE_WANDB:
     wandb.finish()
+
+# Save model and arguments as JSON
+save_path = os.path.join("saved_models", run_name)
+if not os.path.exists(save_path):
+    os.makedirs(save_path)
+    torch.save(model.state_dict(), os.path.join(save_path, "model.pt"))
+    torch.save(bw_model.state_dict(), os.path.join(save_path, "bw_model.pt"))
+    torch.save(logZ, os.path.join(save_path, "logZ.pt"))
+    with open(os.path.join(save_path, "args.json"), "w") as f:
+        json.dump(vars(args), f)

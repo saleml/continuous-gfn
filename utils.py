@@ -2,11 +2,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from sklearn.neighbors import KernelDensity
+from scipy.special import logsumexp
 
 
-def get_test_states(n=100):
-    x = np.linspace(0.001, 1, n)
-    y = np.linspace(0.001, 1, n)
+def get_test_states(n=100, maxi=1.0):
+    x = np.linspace(0.001, maxi, n)
+    y = np.linspace(0.001, maxi, n)
     xx, yy = np.meshgrid(x, y)
     test_states = np.stack([xx, yy], axis=-1).reshape(-1, 2)
     return test_states, n
@@ -58,11 +59,13 @@ def estimate_jsd(kde1, kde2):
     # Estimate Jensen-Shannon divergence between two KDEs
     test_states, n = get_test_states()
     log_dens1 = kde1.score_samples(test_states)
+    log_dens1 = log_dens1 - logsumexp(log_dens1)
     log_dens2 = kde2.score_samples(test_states)
+    log_dens2 = log_dens2 - logsumexp(log_dens2)
     log_dens = np.log(0.5 * np.exp(log_dens1) + 0.5 * np.exp(log_dens2))
-    jsd = np.mean(np.exp(log_dens1) * (log_dens1 - log_dens))
-    jsd += np.mean(np.exp(log_dens2) * (log_dens2 - log_dens))
-    return jsd
+    jsd = np.sum(np.exp(log_dens1) * (log_dens1 - log_dens))
+    jsd += np.sum(np.exp(log_dens2) * (log_dens2 - log_dens))
+    return jsd / 2.0
 
 
 def plot_trajectories(trajectories, plot=False):

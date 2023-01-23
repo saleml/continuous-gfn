@@ -30,7 +30,14 @@ class NeuralNet(nn.Module):
 
 class CirclePF(NeuralNet):
     def __init__(
-        self, hidden_dim=64, n_hidden=2, n_components=1, beta_min=0.1, beta_max=2.0
+        self,
+        hidden_dim=64,
+        n_hidden=2,
+        n_components_s0=1,
+        n_components=1,
+        beta_min=0.1,
+        beta_max=2.0,
+        one_component=False,
     ):
         output_dim = 1 + 3 * n_components
         super().__init__(
@@ -40,17 +47,19 @@ class CirclePF(NeuralNet):
         # The following parameters are for PF(. | s0)
         self.PFs0 = nn.ParameterDict(
             {
-                "log_alpha_r": nn.Parameter(torch.zeros(n_components)),
-                "log_alpha_theta": nn.Parameter(torch.zeros(n_components)),
-                "log_beta_r": nn.Parameter(torch.zeros(n_components)),
-                "log_beta_theta": nn.Parameter(torch.zeros(n_components)),
-                "logits": nn.Parameter(torch.zeros(n_components)),
+                "log_alpha_r": nn.Parameter(torch.zeros(n_components_s0)),
+                "log_alpha_theta": nn.Parameter(torch.zeros(n_components_s0)),
+                "log_beta_r": nn.Parameter(torch.zeros(n_components_s0)),
+                "log_beta_theta": nn.Parameter(torch.zeros(n_components_s0)),
+                "logits": nn.Parameter(torch.zeros(n_components_s0)),
             }
         )
 
         self.n_components = n_components
+        self.n_components_s0 = n_components_s0
         self.beta_min = beta_min
         self.beta_max = beta_max
+        self.one_component = one_component
 
     def forward(self, x):
         out = super().forward(x)
@@ -80,6 +89,10 @@ class CirclePF(NeuralNet):
             beta_r = self.beta_max * torch.sigmoid(beta_r) + self.beta_min
             beta_theta = self.PFs0["log_beta_theta"]
             beta_theta = self.beta_max * torch.sigmoid(beta_theta) + self.beta_min
+            if self.one_component:
+                dist_r = Beta(alpha_r.squeeze(), beta_r.squeeze())
+                dist_theta = Beta(alpha_theta.squeeze(), beta_theta.squeeze())
+                return dist_r, dist_theta
 
             logits = self.PFs0["logits"]
             dist_r = MixtureSameFamily(
@@ -94,6 +107,9 @@ class CirclePF(NeuralNet):
 
         # Otherwise, we use the neural network
         exit_proba, mixture_logits, alpha, beta = self.forward(x)
+        if self.one_component:
+            dist = Beta(alpha.squeeze(), beta.squeeze())
+            return exit_proba, dist
         dist = MixtureSameFamily(
             Categorical(logits=mixture_logits),
             Beta(alpha, beta),

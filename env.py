@@ -1,5 +1,6 @@
 import torch
 from torchtyping import TensorType
+from torch.distributions import MultivariateNormal
 
 
 class Box:
@@ -15,7 +16,8 @@ class Box:
         R0=0.1,
         R1=0.5,
         R2=2.0,
-        reward_cos=False,
+        reward_debug=False,
+        reward_gaussian=False,
         device_str="cpu",
         verify_actions=True,
     ):
@@ -32,7 +34,8 @@ class Box:
         self.R0 = R0
         self.R1 = R1
         self.R2 = R2
-        self.reward_cos = reward_cos
+        self.reward_debug = reward_debug
+        self.reward_gaussian = reward_gaussian
 
     def is_actions_valid(
         self, states: TensorType["n", "dim"], actions: TensorType["n", "dim"]
@@ -96,26 +99,42 @@ class Box:
     def reward(self, final_states: TensorType["n", "dim"]) -> TensorType["n"]:
         R0, R1, R2 = (self.R0, self.R1, self.R2)
         ax = abs(final_states - 0.5)
-        if not self.reward_cos:
+        if not self.reward_debug and not self.reward_gaussian:
             reward = (
                 R0 + (0.25 < ax).prod(-1) * R1 + ((0.3 < ax) * (ax < 0.4)).prod(-1) * R2
             )
+        elif self.reward_debug:
+            reward = torch.ones(final_states.shape[0], device=self.device)
+            reward[final_states.norm(dim=-1) > self.delta] = 1e-8
+        elif self.reward_gaussian:
+            # The reward is the sum of the densities of 4 gaussians centered at (0.1, 0.1), (0.1, 0.9), (0.9, 0.1), (0.9, 0.9).
+            # The gaussians are isotropic with variance 0.01.
+            gaussians = [
+                MultivariateNormal(torch.tensor([0.1, 0.1]), torch.eye(2) * 0.01),
+                MultivariateNormal(torch.tensor([0.1, 0.9]), torch.eye(2) * 0.01),
+                MultivariateNormal(torch.tensor([0.9, 0.1]), torch.eye(2) * 0.01),
+                MultivariateNormal(torch.tensor([0.9, 0.9]), torch.eye(2) * 0.01),
+            ]
+            reward = torch.sum(
+                torch.stack([g.log_prob(final_states).exp() for g in gaussians]), dim=0
+            )
         else:
-            pdf_input = ax * 5
-            pdf = 1.0 / (2 * torch.pi) ** 0.5 * torch.exp(-(pdf_input**2) / 2)
-            reward = R0 + ((torch.cos(ax * 50) + 1) * pdf).prod(-1) * R1
+            raise NotImplementedError
+
         return reward
 
     @property
     def Z(self):
-        if not self.reward_cos:
+        if not self.reward_debug:
             return (
                 self.R0
                 + (2 * 0.25) ** self.dim * self.R1
                 + (2 * 0.1) ** self.dim * self.R2
             )
         else:
-            return self.R0 + self.R1 * 0.1973 ** 2  # 0.1973 is the integral of the pdf, evaluated with Wolfram Alpha
+            if self.dim != 2:
+                raise NotImplementedError("Only implemented for dim=2")
+            return torch.pi * self.delta ** 2 / 4.
 
 
 def get_last_states(
