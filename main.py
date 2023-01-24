@@ -24,6 +24,7 @@ from utils import (
 
 
 USE_WANDB = True
+NO_PLOT = False
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dim", type=int, default=2)
@@ -101,8 +102,11 @@ parser.add_argument("--n_iterations", type=int, default=20000)
 parser.add_argument("--hidden_dim", type=int, default=128)
 parser.add_argument("--n_hidden", type=int, default=3)
 parser.add_argument("--n_evaluation_trajectories", type=int, default=10000)
+parser.add_argument("--no_plot", action="store_true", default=False)
 args = parser.parse_args()
 
+if args.no_plot:
+    NO_PLOT = True
 
 if USE_WANDB:
     wandb.init(project="continuous_gflownets", save_code=True)
@@ -127,7 +131,7 @@ if seed == 0:
     seed = np.random.randint(int(1e6))
 
 run_name = f"d{delta}_{loss_type}_PB{args.PB}_lr{lr}_lrZ{lr_Z}_sd{seed}"
-run_name += f"_n{n_components}_n0{n_components_s0}_eps{epsilon}"
+run_name += f"_n{n_components}_n0{n_components_s0}_eps{epsilon}{'_dir' if args.directed_exploration else ''}"
 run_name += f"_min{min_terminate_proba}_max{max_terminate_proba}_shift{max_terminate_proba_shift}"
 print(run_name)
 if USE_WANDB:
@@ -196,7 +200,18 @@ def sample_actions(
         if epsilon > 0:
             uniform_mask = torch.rand(batch_size) < epsilon
             samples_r[uniform_mask] = torch.rand_like(samples_r[uniform_mask])
-            samples_theta[uniform_mask] = torch.rand_like(samples_theta[uniform_mask])
+            if args.directed_exploration:
+                exploration_distribution = torch.distributions.Beta(
+                    torch.tensor([0.5]), torch.tensor([0.5])
+                )
+                samples_theta[uniform_mask] = exploration_distribution.sample(
+                    torch.Size((samples_r[uniform_mask].shape[0],))
+                ).squeeze()
+            else:
+                samples_theta[uniform_mask] = torch.rand_like(
+                    samples_theta[uniform_mask]
+                )
+
         actions = (
             torch.stack(
                 [
@@ -254,7 +269,15 @@ def sample_actions(
         samples = dist.sample()
         if epsilon > 0:
             uniform_mask = torch.rand(batch_size) < epsilon
-            samples[uniform_mask] = torch.rand_like(samples[uniform_mask])
+            if args.directed_exploration:
+                exploration_distribution = torch.distributions.Beta(
+                    torch.tensor([0.5]), torch.tensor([0.5])
+                )
+                samples[uniform_mask] = exploration_distribution.sample(
+                    torch.Size((samples[uniform_mask].shape[0],))
+                ).squeeze()
+            else:
+                samples[uniform_mask] = torch.rand_like(samples[uniform_mask])
         actions = samples * (B - A) + A
         actions *= torch.pi / 2.0
         actions = (
@@ -459,22 +482,30 @@ for i in trange(n_iterations):
         jsd = estimate_jsd(kde, true_kde)
 
         if USE_WANDB:
-            colors = plt.cm.rainbow(np.linspace(0, 1, 10))
+            if NO_PLOT:
+                wandb.log(
+                    {
+                        "jsd": jsd,
+                    },
+                    step=i,
+                )
+            else:
+                colors = plt.cm.rainbow(np.linspace(0, 1, 10))
 
-            fig1 = plot_samples(last_states[:2000].detach().cpu().numpy())
-            fig2 = plot_trajectories(trajectories.detach().cpu().numpy()[:20])
-            fig3 = plot_termination_probabilities(model)
+                fig1 = plot_samples(last_states[:2000].detach().cpu().numpy())
+                fig2 = plot_trajectories(trajectories.detach().cpu().numpy()[:20])
+                fig3 = plot_termination_probabilities(model)
 
-            wandb.log(
-                {
-                    "last_states": wandb.Image(fig1),
-                    "trajectories": wandb.Image(fig2),
-                    "termination_probs": wandb.Image(fig3),
-                    "kde": wandb.Image(fig4),
-                    "JSD": jsd,
-                },
-                step=i,
-            )
+                wandb.log(
+                    {
+                        "last_states": wandb.Image(fig1),
+                        "trajectories": wandb.Image(fig2),
+                        "termination_probs": wandb.Image(fig3),
+                        "kde": wandb.Image(fig4),
+                        "JSD": jsd,
+                    },
+                    step=i,
+                )
 
 
 if USE_WANDB:
