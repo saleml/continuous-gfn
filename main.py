@@ -1,7 +1,6 @@
 import json
 import os
 import torch
-from torch.distributions import Distribution, Beta
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm, trange
@@ -10,7 +9,13 @@ import argparse
 from sklearn.neighbors import KernelDensity
 
 from env import Box, get_last_states
-from model import CirclePF, CirclePB
+from model import CirclePF, CirclePB, NeuralNet
+from sampling import (
+    sample_actions,
+    sample_trajectories,
+    evaluate_backward_logprobs,
+    evaluate_state_flows,
+)
 
 from utils import (
     fit_kde,
@@ -87,16 +92,32 @@ parser.add_argument(
     default=False,
     help="If true, use a Beta(0.5, 0.5) instead of uniform to temper",
 )
-parser.add_argument("--loss", type=str, choices=["tb", "hvi", "soft"], default="tb")
+parser.add_argument(
+    "--loss", type=str, choices=["tb", "hvi", "soft", "db"], default="tb"
+)
+parser.add_argument(
+    "--alpha",
+    type=float,
+    default=1.0,
+    help="Weight of the reward term in DB",
+)
+parser.add_argument(
+    "--alpha_schedule",
+    type=float,
+    default=1.0,
+    help="every 1000 iterations, divide alpha by this value - the maximum value of alpha is 1.0",
+)
 parser.add_argument(
     "--PB",
     type=str,
     choices=["learnable", "tied", "uniform"],
     default="learnable",
 )
+parser.add_argument("--gamma_scheduler", type=float, default=1.0)
+parser.add_argument("--scheduler_milestone", type=int, default=5000)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--lr", type=float, default=1e-3)
-parser.add_argument("--lr_Z", type=float, default=5e-2)
+parser.add_argument("--lr_Z", type=float, default=1e-3)
 parser.add_argument("--BS", type=int, default=128)
 parser.add_argument("--n_iterations", type=int, default=20000)
 parser.add_argument("--hidden_dim", type=int, default=128)
@@ -184,215 +205,13 @@ bw_model = CirclePB(
     beta_min=args.beta_min,
     beta_max=args.beta_max,
 )
-
-
-def sample_actions(
-    model, states, min_terminate_proba=0.0, max_terminate_proba=1.0, epsilon=0.0
-):
-    # with probability epsilon, sample uniformly in the quarter circle
-    # states is a tensor of shape (n, dim)
-    batch_size = states.shape[0]
-    out = model.to_dist(states)
-    if isinstance(out[0], Distribution):  # s0 input
-        dist_r, dist_theta = out
-        samples_r = dist_r.sample(torch.Size((batch_size,)))
-        samples_theta = dist_theta.sample(torch.Size((batch_size,)))
-        if epsilon > 0:
-            uniform_mask = torch.rand(batch_size) < epsilon
-            samples_r[uniform_mask] = torch.rand_like(samples_r[uniform_mask])
-            if args.directed_exploration:
-                exploration_distribution = torch.distributions.Beta(
-                    torch.tensor([0.5]), torch.tensor([0.5])
-                )
-                samples_theta[uniform_mask] = exploration_distribution.sample(
-                    torch.Size((samples_r[uniform_mask].shape[0],))
-                ).squeeze()
-            else:
-                samples_theta[uniform_mask] = torch.rand_like(
-                    samples_theta[uniform_mask]
-                )
-
-        actions = (
-            torch.stack(
-                [
-                    samples_r * torch.cos(torch.pi / 2.0 * samples_theta),
-                    samples_r * torch.sin(torch.pi / 2.0 * samples_theta),
-                ],
-                dim=1,
-            )
-            * env.delta
-        )
-        logprobs = (
-            dist_r.log_prob(samples_r)
-            + dist_theta.log_prob(samples_theta)
-            # + np.log(4 / (env.delta**2 * np.pi))  # debugging
-            - torch.log(samples_r * env.delta)
-            - np.log(np.pi / 2)
-            - np.log(env.delta)  # why ?
-        )
-        # print("logprobs", logprobs.exp().mean(), logprobs.exp().std())
-        # print(
-        #     (2 * dist_r.log_prob(samples_r).exp() / samples_r).mean(),  # pdf of radius for uniform in disk
-        #     (2 * dist_r.log_prob(samples_r).exp() / samples_r).std(),
-        # )
-        # print(
-        #     dist_theta.log_prob(samples_theta).exp().mean(),
-        #     dist_theta.log_prob(samples_theta).exp().std(),
-        # )
-        if n_components == 1 and n_components_s0 == 1:
-            entropies = dist_r.entropy() + dist_theta.entropy()
-        else:
-            entropies = torch.zeros(
-                batch_size
-            )  # the previous line is not implemented in general
-    else:
-        exit_proba, dist = out
-        exit_proba = exit_proba.clamp(min_terminate_proba, max_terminate_proba)
-
-        exit = torch.bernoulli(exit_proba).bool()
-        exit[torch.norm(1 - states, dim=1) <= env.delta] = True
-        exit[torch.any(states >= 1 - env.epsilon, dim=-1)] = True
-        A = torch.where(
-            states[:, 0] <= 1 - env.delta,
-            0.0,
-            2.0 / torch.pi * torch.arccos((1 - states[:, 0]) / env.delta),
-        )
-        B = torch.where(
-            states[:, 1] <= 1 - env.delta,
-            1.0,
-            2.0 / torch.pi * torch.arcsin((1 - states[:, 1]) / env.delta),
-        )
-        assert torch.all(
-            B[~torch.any(states >= 1 - env.delta, dim=-1)]
-            >= A[~torch.any(states >= 1 - env.delta, dim=-1)]
-        )
-        samples = dist.sample()
-        if epsilon > 0:
-            uniform_mask = torch.rand(batch_size) < epsilon
-            if args.directed_exploration:
-                exploration_distribution = torch.distributions.Beta(
-                    torch.tensor([0.5]), torch.tensor([0.5])
-                )
-                samples[uniform_mask] = exploration_distribution.sample(
-                    torch.Size((samples[uniform_mask].shape[0],))
-                ).squeeze()
-            else:
-                samples[uniform_mask] = torch.rand_like(samples[uniform_mask])
-        actions = samples * (B - A) + A
-        actions *= torch.pi / 2.0
-        actions = (
-            torch.stack([torch.cos(actions), torch.sin(actions)], dim=1) * env.delta
-        )
-
-        logprobs = (
-            dist.log_prob(samples)
-            + torch.log(1 - exit_proba)
-            - np.log(env.delta)
-            - np.log(np.pi / 2)
-            - torch.log(B - A)
-            # + torch.log(2.0 / (torch.pi * env.delta * (B - A)))
-            # - 0.5 * torch.log(1 - torch.cos(actions[:, 0]) ** 2)
-        )
-
-        actions[exit] = -float("inf")
-        logprobs[exit] = torch.log(exit_proba[exit])
-        logprobs[torch.norm(1 - states, dim=1) <= env.delta] = 0.0
-        logprobs[torch.any(states >= 1 - env.epsilon, dim=-1)] = 0.0
-
-        if n_components == 1 and n_components_s0 == 1:
-            entropies = (
-                -exit_proba * torch.log(exit_proba)
-                - (1 - exit_proba) * torch.log(1 - exit_proba)
-                + dist.entropy() * (1 - exit_proba)
-            )
-        else:
-            entropies = torch.zeros(
-                batch_size
-            )  # the previous line is not implemented in general
-
-    return actions, logprobs, entropies
-
-
-def sample_trajectories(
-    model, n_trajectories, min_terminate_proba=0.0, max_terminate_proba=1.0, epsilon=0.0
-):
-    step = 0
-    states = torch.zeros((n_trajectories, env.dim), device=env.device)
-    actionss = []
-    trajectories = [states]
-    trajectories_logprobs = torch.zeros((n_trajectories,), device=env.device)
-    trajectories_entropies = torch.zeros((n_trajectories,), device=env.device)
-    while not torch.all(states == env.sink_state):
-        non_terminal_mask = torch.all(states != env.sink_state, dim=-1)
-        actions = torch.full(
-            (n_trajectories, env.dim), -float("inf"), device=env.device
-        )
-        non_terminal_actions, logprobs, entropies = sample_actions(
-            model,
-            states[non_terminal_mask],
-            min_terminate_proba=min_terminate_proba,
-            max_terminate_proba=max_terminate_proba + step * max_terminate_proba_shift,
-            epsilon=epsilon,
-        )
-        actions[non_terminal_mask] = non_terminal_actions.reshape(-1, env.dim)
-        actionss.append(actions)
-        states = env.step(states, actions)
-        trajectories.append(states)
-        trajectories_logprobs[non_terminal_mask] += logprobs
-        trajectories_entropies[non_terminal_mask] += entropies
-        step += 1
-    trajectories = torch.stack(trajectories, dim=1)
-    actionss = torch.stack(actionss, dim=1)
-    return trajectories, actionss, trajectories_logprobs, trajectories_entropies
-
-
-def evaluate_backward_logprobs(model, trajectories):
-    logprobs = torch.zeros((trajectories.shape[0],), device=env.device)
-    for i in range(trajectories.shape[1] - 2, 1, -1):
-        non_sink_mask = torch.all(trajectories[:, i] != env.sink_state, dim=-1)
-        current_states = trajectories[:, i][non_sink_mask]
-        previous_states = trajectories[:, i - 1][non_sink_mask]
-        difference_1 = current_states[:, 0] - previous_states[:, 0]
-        difference_1.clamp_(
-            min=0.0, max=env.delta
-        )  # Should be the case already - just to avoid numerical issues
-        A = torch.where(
-            current_states[:, 0] >= env.delta,
-            0.0,
-            2.0 / torch.pi * torch.arccos((current_states[:, 0]) / env.delta),
-        )
-        B = torch.where(
-            current_states[:, 1] >= env.delta,
-            1.0,
-            2.0 / torch.pi * torch.arcsin((current_states[:, 1]) / env.delta),
-        )
-
-        dist = model.to_dist(current_states)
-
-        step_logprobs = (
-            dist.log_prob(
-                (
-                    1.0
-                    / (B - A)
-                    * (2.0 / torch.pi * torch.acos(difference_1 / env.delta) - A)
-                ).clamp(1e-4, 1 - 1e-4)
-            ).clamp_max(100)
-            - np.log(env.delta)
-            - np.log(np.pi / 2)
-            - torch.log(B - A)
-            # + torch.log(2.0 / (torch.pi * env.delta * (B - A)))
-            # - 0.5 * torch.log(1 - (difference_1 / env.delta) ** 2)
-        )
-
-        if torch.any(torch.isnan(step_logprobs)):
-            raise ValueError("NaN in backward logprobs")
-
-        if torch.any(torch.isinf(step_logprobs)):
-            raise ValueError("Inf in backward logprobs")
-
-        logprobs[non_sink_mask] += step_logprobs
-
-    return logprobs
+if args.loss == "db":
+    flow_model = NeuralNet(
+        hidden_dim=args.hidden_dim,
+        n_hidden=args.n_hidden,
+        torso=model.torso,
+        output_dim=1,
+    )
 
 
 logZ = torch.zeros(1, requires_grad=True)
@@ -408,23 +227,38 @@ if args.PB != "uniform":
     )
 optimizer.add_param_group({"params": [logZ], "lr": lr_Z})
 
+scheduler = torch.optim.lr_scheduler.MultiStepLR(
+    optimizer,
+    milestones=[i * args.scheduler_milestone for i in range(1, 10)],
+    gamma=args.gamma_scheduler,
+)
+
 jsd = float("inf")
 
+current_alpha = args.alpha * args.alpha_schedule
+
 for i in trange(n_iterations):
+    if i % 1000 == 0:
+        current_alpha = max(current_alpha / args.alpha_schedule, 1.0)
+        print(f"current optimizer LR: {optimizer.param_groups[0]['lr']}")
     current_epsilon = epsilon
     current_min_terminate_proba = min_terminate_proba
     current_max_terminate_proba = max_terminate_proba
     optimizer.zero_grad()
-    trajectories, actionss, logprobs, entropies = sample_trajectories(
+    trajectories, actionss, logprobs, all_logprobs = sample_trajectories(
+        env,
         model,
         BS,
         epsilon=current_epsilon,
         min_terminate_proba=current_min_terminate_proba,
         max_terminate_proba=current_max_terminate_proba,
+        max_terminate_proba_shift=max_terminate_proba_shift,
     )
     last_states = get_last_states(env, trajectories)
     logrewards = env.reward(last_states).log()
-    bw_logprobs = evaluate_backward_logprobs(bw_model, trajectories)
+    bw_logprobs, all_bw_logprobs = evaluate_backward_logprobs(
+        env, bw_model, trajectories
+    )
 
     if loss_type == "tb":
         loss = torch.mean((logZ + logprobs - bw_logprobs - logrewards) ** 2)
@@ -433,10 +267,46 @@ for i in trange(n_iterations):
         baseline = scores.mean().detach()
         loss = logprobs * (scores.detach() - baseline) - bw_logprobs
         loss = torch.mean(loss)
-    elif loss_type == "soft":
-        entropic_rewards = logrewards + entropies.detach() * 0.01
-        loss = -logprobs * entropic_rewards
-        loss = torch.mean(loss)
+    elif loss_type == "db":
+        log_state_flows = evaluate_state_flows(env, flow_model, trajectories, logZ)  # type: ignore
+        db_preds = all_logprobs + log_state_flows
+        db_targets = all_bw_logprobs + log_state_flows[:, 1:]
+        if args.alpha == 1.0:
+            db_targets = torch.cat(
+                [
+                    db_targets,
+                    torch.full(
+                        (db_targets.shape[0], 1),
+                        -float("inf"),
+                        device=db_targets.device,
+                    ),
+                ],
+                dim=1,
+            )
+            infinity_mask = db_targets == -float("inf")
+            _, indices_of_first_inf = torch.max(infinity_mask, dim=1)
+            db_targets = db_targets.scatter(
+                1, indices_of_first_inf.unsqueeze(1), logrewards.unsqueeze(1)
+            )
+            flat_db_preds = db_preds[db_preds != -float("inf")]
+            flat_db_targets = db_targets[db_targets != -float("inf")]
+            loss = torch.mean((flat_db_preds - flat_db_targets) ** 2)
+        else:
+            non_infinity_mask = db_preds.flip(1) != -float("inf")
+            _, reverse_indices_of_last_non_inf = torch.max(non_infinity_mask, dim=1)
+            indices_of_last_non_inf = (
+                db_preds.shape[1] - 1 - reverse_indices_of_last_non_inf
+            )
+            db_preds_rewards = db_preds.gather(1, indices_of_last_non_inf.unsqueeze(1))
+            db_preds2 = db_preds.scatter(
+                1, indices_of_last_non_inf.unsqueeze(1), -float("inf")
+            )
+            flat_db_preds = db_preds2[db_preds2 != -float("inf")]
+            flat_db_targets = db_targets[db_targets != -float("inf")]
+            loss = torch.mean(
+                (flat_db_preds - flat_db_targets) ** 2
+            ) + current_alpha * torch.mean((db_preds_rewards - logrewards) ** 2)
+
     else:
         raise ValueError("Unknown loss type")
     if torch.isinf(loss):
@@ -450,6 +320,7 @@ for i in trange(n_iterations):
         if p.grad is not None:
             p.grad.data.clamp_(-10, 10).nan_to_num_(0.0)
     optimizer.step()
+    scheduler.step()
 
     if any(
         [
@@ -472,10 +343,10 @@ for i in trange(n_iterations):
         tqdm.write(
             f"{i}: {loss.item()}, {logZ.item()}, {np.log(env.Z)}, {jsd}, {tuple(trajectories.shape)}"
         )
-    if i % 1000 == 0:
+    if i % 500 == 0:
         # print(list(model.PFs0.values()))
-        trajectories, actionss, logprobs, entropies = sample_trajectories(
-            model, args.n_evaluation_trajectories
+        trajectories, _, _, _ = sample_trajectories(
+            env, model, args.n_evaluation_trajectories
         )
         last_states = get_last_states(env, trajectories)
         kde, fig4 = fit_kde(last_states)
@@ -485,7 +356,7 @@ for i in trange(n_iterations):
             if NO_PLOT:
                 wandb.log(
                     {
-                        "jsd": jsd,
+                        "JSD": jsd,
                     },
                     step=i,
                 )
