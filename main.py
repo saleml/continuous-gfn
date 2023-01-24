@@ -124,10 +124,14 @@ parser.add_argument("--hidden_dim", type=int, default=128)
 parser.add_argument("--n_hidden", type=int, default=3)
 parser.add_argument("--n_evaluation_trajectories", type=int, default=10000)
 parser.add_argument("--no_plot", action="store_true", default=False)
+parser.add_argument("--no_wandb", action="store_true", default=False)
 args = parser.parse_args()
 
 if args.no_plot:
     NO_PLOT = True
+
+if args.no_wandb:
+    USE_WANDB = False
 
 if USE_WANDB:
     wandb.init(project="continuous_gflownets", save_code=True)
