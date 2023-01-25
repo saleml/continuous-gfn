@@ -235,6 +235,37 @@ if __name__ == "__main__":
 
     print(bw_logprobs, all_bw_logprobs)
 
+    exits = torch.full(
+        (trajectories.shape[0], trajectories.shape[1] - 1), -float("inf")
+    )
+
+    msk = torch.all(trajectories[:, 1:] != -float("inf"), dim=-1)
+    exit_proba, _ = model.to_dist(trajectories[:, 1:][msk])
+    exit_proba[torch.norm(1 - trajectories[:, 1:][msk], dim=1) <= env.delta] = 1.0
+    exit_proba[torch.any(trajectories[:, 1:][msk] >= 1 - env.epsilon, dim=1)] = 1.0
+    exits[msk] = exit_proba.log()
+    exits = torch.cat([torch.zeros((trajectories.shape[0], 1)), exits], dim=1)
+
+    non_infinity_mask = all_logprobs != -float("inf")
+    _, indices = torch.max(non_infinity_mask.flip(1), dim=1)
+    indices = all_logprobs.shape[1] - indices - 1
+    new_all_logprobs = all_logprobs.scatter(1, indices.unsqueeze(1), -float("inf"))
+
+    all_log_rewards = torch.full(
+        (trajectories.shape[0], trajectories.shape[1] - 1), -float("inf")
+    )
+    log_rewards = env.reward(trajectories[:, 1:][msk]).log()
+    all_log_rewards[msk] = log_rewards
+
+    all_log_rewards = torch.cat(
+        [logZ * torch.ones((trajectories.shape[0], 1)), all_log_rewards], dim=1
+    )
+    preds = new_all_logprobs[:, :-1] + exits[:, 1:-1] + all_log_rewards[:, :-2]
+    targets = all_bw_logprobs + exits[:, :-2] + all_log_rewards[:, 1:-1]
+    # new_all_logprobs = torch.cat(
+    #     [torch.zeros((trajectories.shape[0], 1)), new_all_logprobs], dim=1
+    # )
+
     log_state_flows = evaluate_state_flows(env, flow, trajectories, logZ)
 
     print(log_state_flows)

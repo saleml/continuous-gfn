@@ -93,7 +93,7 @@ parser.add_argument(
     help="If true, use a Beta(0.5, 0.5) instead of uniform to temper",
 )
 parser.add_argument(
-    "--loss", type=str, choices=["tb", "hvi", "soft", "db"], default="tb"
+    "--loss", type=str, choices=["tb", "hvi", "soft", "db", "modifieddb"], default="tb"
 )
 parser.add_argument(
     "--alpha",
@@ -157,7 +157,8 @@ if seed == 0:
 
 run_name = f"d{delta}_{loss_type}_PB{args.PB}_lr{lr}_lrZ{lr_Z}_sd{seed}"
 run_name += f"_n{n_components}_n0{n_components_s0}_eps{epsilon}{'_dir' if args.directed_exploration else ''}"
-run_name += f"_min{min_terminate_proba}_max{max_terminate_proba}_shift{max_terminate_proba_shift}"
+# run_name += f"_min{min_terminate_proba}_max{max_terminate_proba}_shift{max_terminate_proba_shift}"
+run_name += f"_gamma{args.gamma_scheduler}_mile{args.scheduler_milestone}"
 print(run_name)
 if USE_WANDB:
     wandb.run.name = run_name  # type: ignore
@@ -177,7 +178,7 @@ env = Box(
 
 # Get the true KDE
 samples = sample_from_reward(env, n_samples=10000)
-true_kde, fig1 = fit_kde(samples)
+true_kde, fig1 = fit_kde(samples, plot=True)
 
 if USE_WANDB:
     # log the reward figure
@@ -271,6 +272,47 @@ for i in trange(n_iterations):
         baseline = scores.mean().detach()
         loss = logprobs * (scores.detach() - baseline) - bw_logprobs
         loss = torch.mean(loss)
+    elif loss_type == "modifieddb":
+        exits = torch.full(
+            (trajectories.shape[0], trajectories.shape[1] - 1), -float("inf")
+        )
+        msk = torch.all(trajectories[:, 1:] != -float("inf"), dim=-1)
+        middle_states = trajectories[:, 1:][msk]
+        exit_proba, _ = model.to_dist(middle_states)
+        true_exit_log_probs = torch.zeros_like(exit_proba)  # type: ignore
+        edgy_middle_states_mask = torch.norm(1 - middle_states, dim=-1) <= env.delta
+        other_edgy_middle_states_mask = torch.any(
+            middle_states >= 1 - env.epsilon, dim=-1
+        )
+        true_exit_log_probs[edgy_middle_states_mask] = 0
+        true_exit_log_probs[other_edgy_middle_states_mask] = 0
+        true_exit_log_probs[
+            ~edgy_middle_states_mask & ~other_edgy_middle_states_mask
+        ] = torch.log(
+            exit_proba[~edgy_middle_states_mask & ~other_edgy_middle_states_mask]  # type: ignore
+        )
+
+        exits[msk] = true_exit_log_probs
+        exits = torch.cat([torch.zeros((trajectories.shape[0], 1)), exits], dim=1)
+        non_infinity_mask = all_logprobs != -float("inf")
+        _, indices = torch.max(non_infinity_mask.flip(1), dim=1)
+        indices = all_logprobs.shape[1] - indices - 1
+        new_all_logprobs = all_logprobs.scatter(1, indices.unsqueeze(1), -float("inf"))
+
+        all_log_rewards = torch.full(
+            (trajectories.shape[0], trajectories.shape[1] - 1), -float("inf")
+        )
+        log_rewards = env.reward(trajectories[:, 1:][msk]).log()
+        all_log_rewards[msk] = log_rewards
+
+        all_log_rewards = torch.cat(
+            [logZ * torch.ones((trajectories.shape[0], 1)), all_log_rewards], dim=1
+        )
+        preds = new_all_logprobs[:, :-1] + exits[:, 1:-1] + all_log_rewards[:, :-2]
+        targets = all_bw_logprobs + exits[:, :-2] + all_log_rewards[:, 1:-1]
+        flat_preds = preds[preds != -float("inf")]
+        flat_targets = targets[targets != -float("inf")]
+        loss = torch.mean((flat_preds - flat_targets) ** 2)
     elif loss_type == "db":
         log_state_flows = evaluate_state_flows(env, flow_model, trajectories, logZ)  # type: ignore
         db_preds = all_logprobs + log_state_flows
@@ -353,7 +395,7 @@ for i in trange(n_iterations):
             env, model, args.n_evaluation_trajectories
         )
         last_states = get_last_states(env, trajectories)
-        kde, fig4 = fit_kde(last_states)
+        kde, fig4 = fit_kde(last_states, plot=True)
         jsd = estimate_jsd(kde, true_kde)
 
         if USE_WANDB:

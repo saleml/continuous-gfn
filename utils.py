@@ -39,17 +39,21 @@ def plot_transitions(env, states, new_states):
     plt.show()
 
 
-def fit_kde(last_states, kernel="exponential", bandwidth=0.1, plot=False):
+def fit_kde(
+    last_states, kernel="exponential", bandwidth=0.1, plot=False, show_plot=False
+):
     kde = KernelDensity(kernel=kernel, bandwidth=bandwidth).fit(last_states.numpy())
 
-    test_states, n = get_test_states()
-
-    log_dens = kde.score_samples(test_states)
-    fig = plt.imshow(
-        np.exp(log_dens).reshape(n, n), origin="lower", extent=[0, 1, 0, 1]
-    )
-    plt.colorbar()
+    fig = None
     if plot:
+        test_states, n = get_test_states()
+
+        log_dens = kde.score_samples(test_states)
+        fig = plt.imshow(
+            np.exp(log_dens).reshape(n, n), origin="lower", extent=[0, 1, 0, 1]
+        )
+        plt.colorbar()
+    if show_plot:
         plt.show()
     plt.close("all")
     return kde, fig
