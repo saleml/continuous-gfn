@@ -6,12 +6,10 @@ import numpy as np
 from tqdm import tqdm, trange
 import wandb
 import argparse
-from sklearn.neighbors import KernelDensity
 
 from env import Box, get_last_states
 from model import CirclePF, CirclePB, NeuralNet
 from sampling import (
-    sample_actions,
     sample_trajectories,
     evaluate_backward_logprobs,
     evaluate_state_flows,
@@ -28,21 +26,21 @@ from utils import (
 )
 
 
-USE_WANDB = True
+USE_WANDB = False
 NO_PLOT = False
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dim", type=int, default=2)
 parser.add_argument("--delta", type=float, default=0.25)
-parser.add_argument("--env-epsilon", type=float, default=1e-10)
+parser.add_argument("--env_epsilon", type=float, default=1e-10)
 parser.add_argument(
     "--n_components",
     type=int,
     default=2,
     help="Number of components in Mixture Of Betas",
 )
+
 parser.add_argument("--reward_debug", action="store_true", default=False)
-parser.add_argument("--reward_gaussian", action="store_true", default=False)
 
 parser.add_argument(
     "--n_components_s0",
@@ -51,49 +49,19 @@ parser.add_argument(
     help="Number of components in Mixture Of Betas",
 )
 parser.add_argument(
-    "--beta-min",
+    "--beta_min",
     type=float,
     default=0.1,
     help="Minimum value for the concentration parameters of the Beta distribution",
 )
 parser.add_argument(
-    "--beta-max",
+    "--beta_max",
     type=float,
     default=5.0,
     help="Maximum value for the concentration parameters of the Beta distribution",
 )
 parser.add_argument(
-    "--epsilon",
-    type=float,
-    default=0.0,
-    help="OFF-POLICY: with proba epsilon, sample from the uniform distribution in the quarter circle",
-)
-parser.add_argument(
-    "--min-terminate-proba",
-    type=float,
-    default=0.0,
-    help="OFF-POLICY: all terminating probabilities below this value are set to this value",
-)
-parser.add_argument(
-    "--max-terminate-proba",
-    type=float,
-    default=1.0,
-    help="OFF-POLICY: all terminating probabilities above this value are set to this value",
-)
-parser.add_argument(
-    "--max-terminate-proba-shift",
-    type=float,
-    default=0.0,
-    help="OFF-POLICY: after each action, add this shift to max-terminate-proba (so that it gets to 1 eventually)",
-)
-parser.add_argument(
-    "--directed-exploration",
-    action="store_true",
-    default=False,
-    help="If true, use a Beta(0.5, 0.5) instead of uniform to temper",
-)
-parser.add_argument(
-    "--loss", type=str, choices=["tb", "hvi", "soft", "db", "modifieddb"], default="tb"
+    "--loss", type=str, choices=["tb", "db", "modifieddb"], default="tb"
 )
 parser.add_argument(
     "--alpha",
@@ -146,18 +114,13 @@ n_iterations = args.n_iterations
 BS = args.BS
 n_components = args.n_components
 n_components_s0 = args.n_components_s0
-epsilon = args.epsilon
-min_terminate_proba = args.min_terminate_proba
-max_terminate_proba = args.max_terminate_proba
-max_terminate_proba_shift = args.max_terminate_proba_shift
 loss_type = args.loss
 
 if seed == 0:
     seed = np.random.randint(int(1e6))
 
 run_name = f"d{delta}_{loss_type}_PB{args.PB}_lr{lr}_lrZ{lr_Z}_sd{seed}"
-run_name += f"_n{n_components}_n0{n_components_s0}_eps{epsilon}{'_dir' if args.directed_exploration else ''}"
-# run_name += f"_min{min_terminate_proba}_max{max_terminate_proba}_shift{max_terminate_proba_shift}"
+run_name += f"_n{n_components}_n0{n_components_s0}"
 run_name += f"_gamma{args.gamma_scheduler}_mile{args.scheduler_milestone}"
 print(run_name)
 if USE_WANDB:
@@ -172,8 +135,6 @@ env = Box(
     epsilon=args.env_epsilon,
     device_str="cpu",
     reward_debug=args.reward_debug,
-    reward_gaussian=args.reward_gaussian,
-    verify_actions=False,
 )
 
 # Get the true KDE
@@ -246,18 +207,12 @@ for i in trange(n_iterations):
     if i % 1000 == 0:
         current_alpha = max(current_alpha / args.alpha_schedule, 1.0)
         print(f"current optimizer LR: {optimizer.param_groups[0]['lr']}")
-    current_epsilon = epsilon
-    current_min_terminate_proba = min_terminate_proba
-    current_max_terminate_proba = max_terminate_proba
+
     optimizer.zero_grad()
     trajectories, actionss, logprobs, all_logprobs = sample_trajectories(
         env,
         model,
         BS,
-        epsilon=current_epsilon,
-        min_terminate_proba=current_min_terminate_proba,
-        max_terminate_proba=current_max_terminate_proba,
-        max_terminate_proba_shift=max_terminate_proba_shift,
     )
     last_states = get_last_states(env, trajectories)
     logrewards = env.reward(last_states).log()
@@ -387,10 +342,11 @@ for i in trange(n_iterations):
                 step=i,
             )
         tqdm.write(
-            f"{i}: {loss.item()}, {logZ.item()}, {np.log(env.Z)}, {jsd}, {tuple(trajectories.shape)}"
+            # Loss with 3 digits of precision, logZ with 2 digits of precision, true logZ with 2 digits of precision
+            # Last computed JSD with 4 digits of precision
+            f"Loss: {loss.item():.3f}, logZ: {logZ.item():.2f}, true logZ: {np.log(env.Z):.2f}, JSD: {jsd:.4f}"
         )
     if i % 500 == 0:
-        # print(list(model.PFs0.values()))
         trajectories, _, _, _ = sample_trajectories(
             env, model, args.n_evaluation_trajectories
         )

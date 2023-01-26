@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-from torchtyping import TensorType
-from torch.distributions import Categorical, Beta, MixtureSameFamily, Independent
+from torch.distributions import Categorical, Beta, MixtureSameFamily
 
 
 class NeuralNet(nn.Module):

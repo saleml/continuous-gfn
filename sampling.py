@@ -3,9 +3,7 @@ from torch.distributions import Distribution, Beta
 import numpy as np
 
 
-def sample_actions(
-    env, model, states, min_terminate_proba=0.0, max_terminate_proba=1.0, epsilon=0.0
-):
+def sample_actions(env, model, states):
     # with probability epsilon, sample uniformly in the quarter circle
     # states is a tensor of shape (n, dim)
     batch_size = states.shape[0]
@@ -14,10 +12,6 @@ def sample_actions(
         dist_r, dist_theta = out
         samples_r = dist_r.sample(torch.Size((batch_size,)))
         samples_theta = dist_theta.sample(torch.Size((batch_size,)))
-        if epsilon > 0:
-            uniform_mask = torch.rand(batch_size) < epsilon
-            samples_r[uniform_mask] = torch.rand_like(samples_r[uniform_mask])
-            samples_theta[uniform_mask] = torch.rand_like(samples_theta[uniform_mask])
 
         actions = (
             torch.stack(
@@ -32,23 +26,12 @@ def sample_actions(
         logprobs = (
             dist_r.log_prob(samples_r)
             + dist_theta.log_prob(samples_theta)
-            # + np.log(4 / (env.delta**2 * np.pi))  # debugging
             - torch.log(samples_r * env.delta)
             - np.log(np.pi / 2)
             - np.log(env.delta)  # why ?
         )
-        # print("logprobs", logprobs.exp().mean(), logprobs.exp().std())
-        # print(
-        #     (2 * dist_r.log_prob(samples_r).exp() / samples_r).mean(),  # pdf of radius for uniform in disk
-        #     (2 * dist_r.log_prob(samples_r).exp() / samples_r).std(),
-        # )
-        # print(
-        #     dist_theta.log_prob(samples_theta).exp().mean(),
-        #     dist_theta.log_prob(samples_theta).exp().std(),
-        # )
     else:
         exit_proba, dist = out
-        exit_proba = exit_proba.clamp(min_terminate_proba, max_terminate_proba)
 
         exit = torch.bernoulli(exit_proba).bool()
         exit[torch.norm(1 - states, dim=1) <= env.delta] = True
@@ -68,9 +51,7 @@ def sample_actions(
             >= A[~torch.any(states >= 1 - env.delta, dim=-1)]
         )
         samples = dist.sample()
-        if epsilon > 0:
-            uniform_mask = torch.rand(batch_size) < epsilon
-            samples[uniform_mask] = torch.rand_like(samples[uniform_mask])
+
         actions = samples * (B - A) + A
         actions *= torch.pi / 2.0
         actions = (
@@ -83,8 +64,6 @@ def sample_actions(
             - np.log(env.delta)
             - np.log(np.pi / 2)
             - torch.log(B - A)
-            # + torch.log(2.0 / (torch.pi * env.delta * (B - A)))
-            # - 0.5 * torch.log(1 - torch.cos(actions[:, 0]) ** 2)
         )
 
         actions[exit] = -float("inf")
@@ -95,15 +74,7 @@ def sample_actions(
     return actions, logprobs
 
 
-def sample_trajectories(
-    env,
-    model,
-    n_trajectories,
-    min_terminate_proba=0.0,
-    max_terminate_proba=1.0,
-    max_terminate_proba_shift=0.0,
-    epsilon=0.0,
-):
+def sample_trajectories(env, model, n_trajectories):
     step = 0
     states = torch.zeros((n_trajectories, env.dim), device=env.device)
     actionss = []
@@ -120,9 +91,6 @@ def sample_trajectories(
             env,
             model,
             states[non_terminal_mask],
-            min_terminate_proba=min_terminate_proba,
-            max_terminate_proba=max_terminate_proba + step * max_terminate_proba_shift,
-            epsilon=epsilon,
         )
         actions[non_terminal_mask] = non_terminal_actions.reshape(-1, env.dim)
         actionss.append(actions)
@@ -176,8 +144,6 @@ def evaluate_backward_logprobs(env, model, trajectories):
             - np.log(env.delta)
             - np.log(np.pi / 2)
             - torch.log(B - A)
-            # + torch.log(2.0 / (torch.pi * env.delta * (B - A)))
-            # - 0.5 * torch.log(1 - (difference_1 / env.delta) ** 2)
         )
 
         if torch.any(torch.isnan(step_logprobs)):
@@ -229,23 +195,25 @@ if __name__ == "__main__":
         env, bw_model, trajectories
     )
 
-    print(trajectories)
-
-    print(logprobs, all_logprobs)
-
-    print(bw_logprobs, all_bw_logprobs)
-
     exits = torch.full(
         (trajectories.shape[0], trajectories.shape[1] - 1), -float("inf")
     )
-
     msk = torch.all(trajectories[:, 1:] != -float("inf"), dim=-1)
-    exit_proba, _ = model.to_dist(trajectories[:, 1:][msk])
-    exit_proba[torch.norm(1 - trajectories[:, 1:][msk], dim=1) <= env.delta] = 1.0
-    exit_proba[torch.any(trajectories[:, 1:][msk] >= 1 - env.epsilon, dim=1)] = 1.0
-    exits[msk] = exit_proba.log()
-    exits = torch.cat([torch.zeros((trajectories.shape[0], 1)), exits], dim=1)
+    middle_states = trajectories[:, 1:][msk]
+    exit_proba, _ = model.to_dist(middle_states)
+    true_exit_log_probs = torch.zeros_like(exit_proba)  # type: ignore
+    edgy_middle_states_mask = torch.norm(1 - middle_states, dim=-1) <= env.delta
+    other_edgy_middle_states_mask = torch.any(middle_states >= 1 - env.epsilon, dim=-1)
+    true_exit_log_probs[edgy_middle_states_mask] = 0
+    true_exit_log_probs[other_edgy_middle_states_mask] = 0
+    true_exit_log_probs[
+        ~edgy_middle_states_mask & ~other_edgy_middle_states_mask
+    ] = torch.log(
+        exit_proba[~edgy_middle_states_mask & ~other_edgy_middle_states_mask]  # type: ignore
+    )
 
+    exits[msk] = true_exit_log_probs
+    exits = torch.cat([torch.zeros((trajectories.shape[0], 1)), exits], dim=1)
     non_infinity_mask = all_logprobs != -float("inf")
     _, indices = torch.max(non_infinity_mask.flip(1), dim=1)
     indices = all_logprobs.shape[1] - indices - 1
@@ -262,52 +230,6 @@ if __name__ == "__main__":
     )
     preds = new_all_logprobs[:, :-1] + exits[:, 1:-1] + all_log_rewards[:, :-2]
     targets = all_bw_logprobs + exits[:, :-2] + all_log_rewards[:, 1:-1]
-    # new_all_logprobs = torch.cat(
-    #     [torch.zeros((trajectories.shape[0], 1)), new_all_logprobs], dim=1
-    # )
-
-    log_state_flows = evaluate_state_flows(env, flow, trajectories, logZ)
-
-    print(log_state_flows)
-
-    print("FPF:", all_logprobs + log_state_flows)
-
-    print("FPB", all_bw_logprobs + log_state_flows[:, 1:])
-
-    last_states = get_last_states(env, trajectories)
-    print(last_states)
-    logrewards = env.reward(last_states).log()
-    print("R", logrewards)
-
-    # assert False
-
-    db_preds = all_logprobs + log_state_flows
-
-    db_targets = all_bw_logprobs + log_state_flows[:, 1:]
-    db_targets = torch.cat(
-        [
-            db_targets,
-            torch.full(
-                (db_targets.shape[0], 1), -float("inf"), device=db_targets.device
-            ),
-        ],
-        dim=1,
-    )
-    infinity_mask = db_targets == -float("inf")
-
-    _, indices_of_first_inf = torch.max(infinity_mask, dim=1)
-
-    db_targets2 = db_targets.scatter(
-        1, indices_of_first_inf.unsqueeze(1), logrewards.unsqueeze(1)
-    )
-
-    print(db_preds)
-    print(db_targets2)
-
-    flat_db_preds = db_preds[db_preds != -float("inf")]
-    flat_db_targets = db_targets2[db_targets2 != -float("inf")]
-
-    print(flat_db_preds)
-    print(flat_db_targets)
-
-    assert False
+    flat_preds = preds[preds != -float("inf")]
+    flat_targets = targets[targets != -float("inf")]
+    loss = torch.mean((flat_preds - flat_targets) ** 2)

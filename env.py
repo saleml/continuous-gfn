@@ -1,5 +1,4 @@
 import torch
-from torchtyping import TensorType
 from torch.distributions import MultivariateNormal
 
 
@@ -17,9 +16,8 @@ class Box:
         R1=0.5,
         R2=2.0,
         reward_debug=False,
-        reward_gaussian=False,
         device_str="cpu",
-        verify_actions=True,
+        verify_actions=False,
     ):
         # Set verify_actions to False to disable action verification for faster step execution.
         self.dim = dim
@@ -35,11 +33,9 @@ class Box:
         self.R1 = R1
         self.R2 = R2
         self.reward_debug = reward_debug
-        self.reward_gaussian = reward_gaussian
 
-    def is_actions_valid(
-        self, states: TensorType["n", "dim"], actions: TensorType["n", "dim"]
-    ) -> TensorType["n", torch.bool]:
+    def is_actions_valid(self, states, actions
+    ):
         """Check if actions are valid: First, verify that no state component is within epsilon distance from the bounds,
         then for each state [x_1, ..., x_d], the action [a_1, ..., a_d] needs to satisfy
         0 <= a_i < min(self.delta_max, 1 - x_i) for all i. Assume all actions are non terminal. Basically, this means
@@ -64,15 +60,11 @@ class Box:
         out = first_condition and second_condition
         return out
 
-    def is_terminal_action_mask(
-        self, actions: TensorType["n", "dim"]
-    ) -> TensorType["n", torch.bool]:
+    def is_terminal_action_mask(self, actions):
         """Return a mask of terminal actions."""
         return torch.all(actions == self.terminal_action, dim=-1)
 
-    def step(
-        self, states: TensorType["n", "dim"], actions: TensorType["n", "dim"]
-    ) -> TensorType["n", "dim"]:
+    def step(self, states, actions) :
         """Take a step in the environment. The states can include the sink state [-inf, ..., -inf].
         In which case, the corresponding actions are ignored."""
         # First, select the states that are not the sink state.
@@ -96,28 +88,16 @@ class Box:
         # Finally, return the new states.
         return new_states
 
-    def reward(self, final_states: TensorType["n", "dim"]) -> TensorType["n"]:
+    def reward(self, final_states):
         R0, R1, R2 = (self.R0, self.R1, self.R2)
         ax = abs(final_states - 0.5)
-        if not self.reward_debug and not self.reward_gaussian:
+        if not self.reward_debug:
             reward = (
                 R0 + (0.25 < ax).prod(-1) * R1 + ((0.3 < ax) * (ax < 0.4)).prod(-1) * R2
             )
         elif self.reward_debug:
             reward = torch.ones(final_states.shape[0], device=self.device)
             reward[final_states.norm(dim=-1) > self.delta] = 1e-8
-        elif self.reward_gaussian:
-            # The reward is the sum of the densities of 4 gaussians centered at (0.1, 0.1), (0.1, 0.9), (0.9, 0.1), (0.9, 0.9).
-            # The gaussians are isotropic with variance 0.01.
-            gaussians = [
-                MultivariateNormal(torch.tensor([0.1, 0.1]), torch.eye(2) * 0.01),
-                MultivariateNormal(torch.tensor([0.1, 0.9]), torch.eye(2) * 0.01),
-                MultivariateNormal(torch.tensor([0.9, 0.1]), torch.eye(2) * 0.01),
-                MultivariateNormal(torch.tensor([0.9, 0.9]), torch.eye(2) * 0.01),
-            ]
-            reward = torch.sum(
-                torch.stack([g.log_prob(final_states).exp() for g in gaussians]), dim=0
-            )
         else:
             raise NotImplementedError
 
@@ -137,9 +117,7 @@ class Box:
             return torch.pi * self.delta ** 2 / 4.
 
 
-def get_last_states(
-    env: Box, trajectories: TensorType["n_traj", "n", "dim"]
-) -> TensorType["n_traj", "dim"]:
+def get_last_states(env: Box, trajectories):
     """Get last states from trajectories.
     Args:
         trajectories: A tensor of trajectories
