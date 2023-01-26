@@ -6,6 +6,7 @@ wabdb/settings
 old/*
 saved_models/*
 *.pdf
+*.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

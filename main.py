@@ -222,11 +222,6 @@ for i in trange(n_iterations):
 
     if loss_type == "tb":
         loss = torch.mean((logZ + logprobs - bw_logprobs - logrewards) ** 2)
-    elif loss_type == "hvi":
-        scores = logprobs - bw_logprobs - logrewards
-        baseline = scores.mean().detach()
-        loss = logprobs * (scores.detach() - baseline) - bw_logprobs
-        loss = torch.mean(loss)
     elif loss_type == "modifieddb":
         exits = torch.full(
             (trajectories.shape[0], trajectories.shape[1] - 1), -float("inf")
