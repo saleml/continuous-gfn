@@ -39,7 +39,6 @@ class CirclePF(NeuralNet):
         n_components=1,
         beta_min=0.1,
         beta_max=2.0,
-        one_component=False,
     ):
         output_dim = 1 + 3 * n_components
         super().__init__(
@@ -61,7 +60,6 @@ class CirclePF(NeuralNet):
         self.n_components_s0 = n_components_s0
         self.beta_min = beta_min
         self.beta_max = beta_max
-        self.one_component = one_component
 
     def forward(self, x):
         out = super().forward(x)
@@ -91,10 +89,6 @@ class CirclePF(NeuralNet):
             beta_r = self.beta_max * torch.sigmoid(beta_r) + self.beta_min
             beta_theta = self.PFs0["log_beta_theta"]
             beta_theta = self.beta_max * torch.sigmoid(beta_theta) + self.beta_min
-            if self.one_component:
-                dist_r = Beta(alpha_r.squeeze(), beta_r.squeeze())
-                dist_theta = Beta(alpha_theta.squeeze(), beta_theta.squeeze())
-                return dist_r, dist_theta
 
             logits = self.PFs0["logits"]
             dist_r = MixtureSameFamily(

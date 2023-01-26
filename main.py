@@ -163,7 +163,6 @@ model = CirclePF(
     n_hidden=args.n_hidden,
     n_components=n_components,
     n_components_s0=n_components_s0,
-    one_component=n_components == 1 and n_components_s0 == 1,
     beta_min=args.beta_min,
     beta_max=args.beta_max,
 )
