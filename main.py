@@ -4,7 +4,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm, trange
-import wandb
+
 import argparse
 
 from env import Box, get_last_states
@@ -24,6 +24,11 @@ from utils import (
     plot_trajectories,
     plot_termination_probabilities,
 )
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    pass
 
 
 USE_WANDB = False
