@@ -103,9 +103,6 @@ class CirclePF(NeuralNet):
 
         # Otherwise, we use the neural network
         exit_proba, mixture_logits, alpha, beta = self.forward(x)
-        if self.one_component:
-            dist = Beta(alpha.squeeze(), beta.squeeze())
-            return exit_proba, dist
         dist = MixtureSameFamily(
             Categorical(logits=mixture_logits),
             Beta(alpha, beta),
