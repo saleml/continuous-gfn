@@ -4,7 +4,6 @@ import numpy as np
 
 
 def sample_actions(env, model, states):
-    # with probability epsilon, sample uniformly in the quarter circle
     # states is a tensor of shape (n, dim)
     batch_size = states.shape[0]
     out = model.to_dist(states)

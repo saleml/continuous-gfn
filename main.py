@@ -66,7 +66,7 @@ parser.add_argument(
     help="Maximum value for the concentration parameters of the Beta distribution",
 )
 parser.add_argument(
-    "--loss", type=str, choices=["tb", "db", "modifieddb"], default="tb"
+    "--loss", type=str, choices=["tb", "db", "modifieddb", "reinforce_tb"], default="tb"
 )
 parser.add_argument(
     "--alpha",
@@ -226,6 +226,12 @@ for i in trange(n_iterations):
 
     if loss_type == "tb":
         loss = torch.mean((logZ + logprobs - bw_logprobs - logrewards) ** 2)
+    elif loss_type == "reinforce_tb":
+        losses = (logZ + logprobs - bw_logprobs - logrewards) ** 2
+        baseline = losses.mean()
+        term_1 = (losses - baseline).detach() * logprobs
+        term_2 = losses
+        loss = torch.mean(term_1 + term_2)
     elif loss_type == "modifieddb":
         exits = torch.full(
             (trajectories.shape[0], trajectories.shape[1] - 1), -float("inf")
@@ -343,7 +349,7 @@ for i in trange(n_iterations):
         tqdm.write(
             # Loss with 3 digits of precision, logZ with 2 digits of precision, true logZ with 2 digits of precision
             # Last computed JSD with 4 digits of precision
-            f"Loss: {loss.item():.3f}, logZ: {logZ.item():.2f}, true logZ: {np.log(env.Z):.2f}, JSD: {jsd:.4f}"
+            f"States: {(i + 1) * BS}, Loss: {loss.item():.3f}, logZ: {logZ.item():.2f}, true logZ: {np.log(env.Z):.2f}, JSD: {jsd:.4f}"
         )
     if i % 500 == 0:
         trajectories, _, _, _ = sample_trajectories(
