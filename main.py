@@ -86,8 +86,8 @@ parser.add_argument(
     choices=["learnable", "tied", "uniform"],
     default="learnable",
 )
-parser.add_argument("--gamma_scheduler", type=float, default=1.0)
-parser.add_argument("--scheduler_milestone", type=int, default=5000)
+parser.add_argument("--gamma_scheduler", type=float, default=0.5)
+parser.add_argument("--scheduler_milestone", type=int, default=2500)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--lr", type=float, default=1e-3)
 parser.add_argument("--lr_Z", type=float, default=1e-3)
