@@ -31,7 +31,7 @@ except ModuleNotFoundError:
     pass
 
 
-USE_WANDB = False
+USE_WANDB = True
 NO_PLOT = False
 
 parser = argparse.ArgumentParser()
@@ -91,6 +91,8 @@ parser.add_argument("--scheduler_milestone", type=int, default=2500)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--lr", type=float, default=1e-3)
 parser.add_argument("--lr_Z", type=float, default=1e-3)
+parser.add_argument("--lr_F", type=float, default=1e-2)
+parser.add_argument("--tie_F", action="store_true", default=False)
 parser.add_argument("--BS", type=int, default=128)
 parser.add_argument("--n_iterations", type=int, default=20000)
 parser.add_argument("--hidden_dim", type=int, default=128)
@@ -98,6 +100,7 @@ parser.add_argument("--n_hidden", type=int, default=3)
 parser.add_argument("--n_evaluation_trajectories", type=int, default=10000)
 parser.add_argument("--no_plot", action="store_true", default=False)
 parser.add_argument("--no_wandb", action="store_true", default=False)
+parser.add_argument("--wandb_project", type=str, default="continuous_gflownets")
 args = parser.parse_args()
 
 if args.no_plot:
@@ -107,7 +110,7 @@ if args.no_wandb:
     USE_WANDB = False
 
 if USE_WANDB:
-    wandb.init(project="continuous_gflownets", save_code=True)
+    wandb.init(project=args.wandb_project, save_code=True)
     wandb.config.update(args)
 
 dim = args.dim
@@ -115,6 +118,7 @@ delta = args.delta
 seed = args.seed
 lr = args.lr
 lr_Z = args.lr_Z
+lr_F = args.lr_F
 n_iterations = args.n_iterations
 BS = args.BS
 n_components = args.n_components
@@ -179,7 +183,7 @@ if args.loss == "db":
     flow_model = NeuralNet(
         hidden_dim=args.hidden_dim,
         n_hidden=args.n_hidden,
-        torso=model.torso,
+        torso=None if not args.tie_F else model.torso,
         output_dim=1,
     )
 
@@ -196,6 +200,16 @@ if args.PB != "uniform":
         }
     )
 optimizer.add_param_group({"params": [logZ], "lr": lr_Z})
+if args.loss == "db":
+    optimizer.add_param_group(
+        {
+            "params": flow_model.output_layer.parameters()
+            if args.tie_F
+            else flow_model.parameters(),
+            "lr": lr_F,
+        }
+    )
+    print("using flow model")
 
 scheduler = torch.optim.lr_scheduler.MultiStepLR(
     optimizer,
